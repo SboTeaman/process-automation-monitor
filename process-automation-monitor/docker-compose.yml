@@ -1,0 +1,143 @@
+version: "3.9"
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  mysql_data:
+  mysql_analytics_data:
+
+services:
+
+  # ─── Databases ───────────────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: orchestrator-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-orchestrator_db}
+      POSTGRES_USER: ${POSTGRES_USER:-orchestrator}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-orchestrator} -d ${POSTGRES_DB:-orchestrator_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  mysql:
+    image: mysql:8.0
+    container_name: worker-mysql
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-worker_db}
+      MYSQL_USER: ${MYSQL_USER:-worker}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-changeme}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-changeme_root}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "${MYSQL_USER:-worker}", "-p${MYSQL_PASSWORD:-changeme}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  mysql-analytics:
+    image: mysql:8.0
+    container_name: analytics-mysql
+    environment:
+      MYSQL_DATABASE: ${MYSQL_ANALYTICS_DATABASE:-analytics_db}
+      MYSQL_USER: ${MYSQL_ANALYTICS_USER:-analytics}
+      MYSQL_PASSWORD: ${MYSQL_ANALYTICS_PASSWORD:-changeme}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ANALYTICS_ROOT_PASSWORD:-changeme_root}
+    volumes:
+      - mysql_analytics_data:/var/lib/mysql
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "${MYSQL_ANALYTICS_USER:-analytics}", "-p${MYSQL_ANALYTICS_PASSWORD:-changeme}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  # ─── Application Services ─────────────────────────────────────────────────────
+
+  orchestrator-service:
+    build:
+      context: ./orchestrator-service
+      dockerfile: Dockerfile
+    container_name: orchestrator-service
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-orchestrator_db}
+      SPRING_DATASOURCE_USERNAME: ${POSTGRES_USER:-orchestrator}
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXPIRY_MINUTES: ${JWT_EXPIRY_MINUTES:-15}
+      JWT_REFRESH_EXPIRY_DAYS: ${JWT_REFRESH_EXPIRY_DAYS:-7}
+      WORKER_SERVICE_URL: ${WORKER_SERVICE_URL:-http://worker-service:8000}
+      WORKER_API_KEY: ${WORKER_API_KEY}
+      ANALYTICS_API_KEY: ${ANALYTICS_API_KEY}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000}
+      MAIL_HOST: ${MAIL_HOST:-smtp.gmail.com}
+      MAIL_PORT: ${MAIL_PORT:-587}
+      MAIL_USERNAME: ${MAIL_USERNAME:-}
+      MAIL_PASSWORD: ${MAIL_PASSWORD:-}
+      SWAGGER_ENABLED: ${SWAGGER_ENABLED:-false}
+      SPRING_PROFILES_ACTIVE: docker
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  worker-service:
+    build:
+      context: ./worker-service
+      dockerfile: Dockerfile
+    container_name: worker-service
+    ports:
+      - "8000:8000"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: mysql+pymysql://${MYSQL_USER:-worker}:${MYSQL_PASSWORD:-changeme}@mysql:3306/${MYSQL_DATABASE:-worker_db}
+      SERVICE_NAME: worker-service
+      WORKER_API_KEY: ${WORKER_API_KEY}
+      DATA_DIR: /data
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  analytics-service:
+    build:
+      context: ./analytics-service
+      dockerfile: Dockerfile
+    container_name: analytics-service
+    ports:
+      - "8001:8001"
+    depends_on:
+      mysql-analytics:
+        condition: service_healthy
+    environment:
+      ANALYTICS_DB_URL: mysql+pymysql://${MYSQL_ANALYTICS_USER:-analytics}:${MYSQL_ANALYTICS_PASSWORD:-changeme}@mysql-analytics:3306/${MYSQL_ANALYTICS_DATABASE:-analytics_db}
+      ORCHESTRATOR_DB_URL: postgresql://${POSTGRES_USER:-orchestrator}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/${POSTGRES_DB:-orchestrator_db}
+      ANALYTICS_API_KEY: ${ANALYTICS_API_KEY}
+    networks:
+      - app-network
+    restart: unless-stopped
