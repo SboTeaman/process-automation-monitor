@@ -1,0 +1,169 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: postgres-backup
+  namespace: default
+spec:
+  # Run daily at 02:00 UTC
+  schedule: "0 2 * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: backup-sa
+          containers:
+            - name: postgres-backup
+              image: postgres:15-alpine
+              env:
+                - name: DB_HOST
+                  value: postgres
+                - name: DB_PORT
+                  value: "5432"
+                - name: DB_NAME
+                  value: orchestrator_db
+                - name: DB_USER
+                  value: orchestrator
+                - name: DB_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: process-monitor-secrets
+                      key: postgres-password
+                - name: BACKUP_DIR
+                  value: /backups
+                - name: BACKUP_RETENTION_DAYS
+                  value: "30"
+                - name: S3_BUCKET
+                  value: ""  # Set to s3://bucket-name to enable S3 uploads
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  #!/bin/sh
+                  set -e
+                  TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+                  BACKUP_FILE="postgres_orchestrator_db_${TIMESTAMP}.sql.gz"
+                  BACKUP_PATH="/backups/$BACKUP_FILE"
+                  mkdir -p /backups
+                  pg_dump -h $DB_HOST -p $DB_PORT -U $DB_USER $DB_NAME | gzip > $BACKUP_PATH
+                  gunzip -t $BACKUP_PATH && echo "✓ Backup verified: $BACKUP_FILE"
+                  find /backups -name "postgres_*.sql.gz" -mtime +$BACKUP_RETENTION_DAYS -delete
+              volumeMounts:
+                - name: backup-storage
+                  mountPath: /backups
+          restartPolicy: OnFailure
+          volumes:
+            - name: backup-storage
+              persistentVolumeClaim:
+                claimName: backup-pvc
+
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: mysql-backup
+  namespace: default
+spec:
+  # Run daily at 03:00 UTC
+  schedule: "0 3 * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: backup-sa
+          containers:
+            - name: mysql-backup
+              image: mysql:8.0
+              env:
+                - name: DB_HOST
+                  value: mysql
+                - name: DB_PORT
+                  value: "3306"
+                - name: DB_USER
+                  value: root
+                - name: DB_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: process-monitor-secrets
+                      key: mysql-root-password
+                - name: BACKUP_DIR
+                  value: /backups
+                - name: BACKUP_RETENTION_DAYS
+                  value: "30"
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  #!/bin/bash
+                  set -e
+                  TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+                  mkdir -p /backups
+
+                  # Backup worker DB
+                  WORKER_BACKUP="mysql_worker_db_${TIMESTAMP}.sql.gz"
+                  mysqldump -h $DB_HOST -u $DB_USER -p"$DB_PASSWORD" \
+                    --single-transaction --quick worker_db | gzip > /backups/$WORKER_BACKUP
+
+                  # Backup analytics DB
+                  ANALYTICS_BACKUP="mysql_analytics_db_${TIMESTAMP}.sql.gz"
+                  mysqldump -h $DB_HOST -u $DB_USER -p"$DB_PASSWORD" \
+                    --single-transaction --quick analytics_db | gzip > /backups/$ANALYTICS_BACKUP
+
+                  echo "✓ MySQL backups completed"
+                  find /backups -name "mysql_*.sql.gz" -mtime +$BACKUP_RETENTION_DAYS -delete
+              volumeMounts:
+                - name: backup-storage
+                  mountPath: /backups
+          restartPolicy: OnFailure
+          volumes:
+            - name: backup-storage
+              persistentVolumeClaim:
+                claimName: backup-pvc
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: backup-pvc
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: backup-sa
+  namespace: default
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: backup-role
+  namespace: default
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: backup-rolebinding
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: backup-role
+subjects:
+  - kind: ServiceAccount
+    name: backup-sa
+    namespace: default

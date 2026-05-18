@@ -1,0 +1,91 @@
+# ETL CronJob — aggregates execution data from PostgreSQL (orchestrator)
+# into MySQL (analytics) every hour.
+# Populates: daily_stats, job_performance tables.
+
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: etl-job
+  namespace: default
+  labels:
+    app: etl-job
+    component: analytics
+spec:
+  schedule: "0 * * * *"   # every hour, on the hour
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      template:
+        metadata:
+          labels:
+            app: etl-job
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: etl-job
+              image: process-monitor/analytics-service:latest
+              imagePullPolicy: IfNotPresent
+              command: ["python", "-m", "app.etl.etl_job"]
+              env:
+                - name: POSTGRES_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: process-monitor-secrets
+                      key: postgres-password
+                - name: MYSQL_ANALYTICS_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: process-monitor-secrets
+                      key: mysql-analytics-password
+                - name: ORCHESTRATOR_DB_URL
+                  value: postgresql://orchestrator:$(POSTGRES_PASSWORD)@postgres:5432/orchestrator_db
+                - name: ANALYTICS_DB_URL
+                  value: mysql+pymysql://analytics:$(MYSQL_ANALYTICS_PASSWORD)@mysql-analytics:3306/analytics_db
+              resources:
+                requests:
+                  memory: "128Mi"
+                  cpu: "100m"
+                limits:
+                  memory: "256Mi"
+                  cpu: "200m"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Job trigger CronJob — dispatches scheduled process jobs to the orchestrator.
+# Runs every minute to check for jobs due for execution.
+#
+# apiVersion: batch/v1
+# kind: CronJob
+# metadata:
+#   name: job-trigger
+#   namespace: default
+# spec:
+#   schedule: "* * * * *"   # every minute
+#   concurrencyPolicy: Forbid
+#   successfulJobsHistoryLimit: 3
+#   failedJobsHistoryLimit: 1
+#   jobTemplate:
+#     spec:
+#       backoffLimit: 1
+#       template:
+#         spec:
+#           restartPolicy: OnFailure
+#           containers:
+#             - name: job-trigger
+#               image: process-monitor/orchestrator-service:latest
+#               command: ["java", "-cp", "app.jar", "com.processmonitor.scheduler.CronTriggerRunner"]
+#               env:
+#                 - name: SPRING_DATASOURCE_URL
+#                   value: jdbc:postgresql://postgres:5432/orchestrator_db
+#                 - name: SPRING_DATASOURCE_USERNAME
+#                   value: orchestrator
+#                 - name: SPRING_DATASOURCE_PASSWORD
+#                   valueFrom:
+#                     secretKeyRef:
+#                       name: process-monitor-secrets
+#                       key: postgres-password
+#                 - name: WORKER_SERVICE_URL
+#                   value: http://worker-service:8000
+# ─────────────────────────────────────────────────────────────────────────────
